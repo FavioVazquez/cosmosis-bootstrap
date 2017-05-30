@@ -1,0 +1,533 @@
+#!/bin/bash
+#
+# We are using bash's pwd, which takes the -P flag on all recent
+# versions of bash, rather than /bin/pwd, which might not.
+#-----------------------------------------------------------------------
+
+# Make sure we've got an architecture we support. Currently, this is
+# only x86_64.
+arch=$(uname -m)
+if [ ! "$arch" == "x86_64" ]
+then
+  die "Sorry, but CosmoSIS currently supports only 64-bit Intel-compatible architecture"
+fi
+
+# Check that we're running on bash. We do this first, because nothing
+# else may work if we're not running bash.
+if [ -z "$BASH" ]
+then
+  die "please run the cosmosis-bootstrap script in the bash shell"
+fi
+
+# Check that we aren't already in a COSMOSIS environment
+cosmo_cmd=$(type cosmosis 2> /dev/null)
+if [ ! -z "$cosmo_cmd" ]
+then
+  echo "CosmoSIS cannot be installed within a CosmoSIS environment. Enter a new shell and try again."
+  exit 1
+fi
+
+# Global variables.
+COSMOSIS_REPOSITORY_URL_BASE="https://github.com/FavioVazquez/"
+UPS_REPOSITORY_URL_BASE="http://scisoft.fnal.gov/scisoft"
+MINICONDA_VERSION=3.9.1
+# We should probably change this to just check out the newest
+# master version at some point once it's all worked out:
+COSMOSIS_VERSION=v1.4.thesis.favio
+
+CURL_="curl -L --fail --retry 2 --silent --retry-delay 1"
+CURL="$CURL_ --remote-name"
+
+QUIET_FLAG=-q
+
+#-----------------------------------------------------------------------
+function usage()
+{
+   cat <<-EOF
+USAGE: $(basename "${0}") [options] <target-directory>
+       $(basename "${0}") installs the software upon which CosmoSIS depends.
+
+OPTIONS:
+    -?: Print this help and exit
+    -d: Install Planck and WMAP data packages (large download)
+    -e: Install external repositories, e.g. des (comma separated list)
+    -h: Print this help and exit
+    -k: Download in insecure mode, ignoring security certificates.  This is dangerous.
+    -p: Skip installing python and related packages
+    -r: Remove UPS installation tarballs after installation (this saves disk space)
+    -t: After cloning the CosmoSIS repository, check out this tag (-x overrides this)
+    -u: Use an existing CosmoSIS UPS installation (d option is ignored).
+    -x: Check out the latest development version of cosmosis (bleeding edge; you can always update later)
+
+'target-directory' is the directory under which everything is
+installed. It will be created if necessary.
+
+EOF
+}
+
+# Exit with an error message.
+function die()
+{
+  echo "$1"
+  exit 1
+}
+
+# Test that xcode command-line tools have been installed. Use this only
+# on OS X.
+function check_xcode_tools()
+{
+  if [ ! -e "/usr/include/wchar.h" ]
+	then
+		die "Unable to locate system headers.  Please try running xcode-select --install to install command line tools."
+	fi
+}
+
+# Get a single UPS product, specified by the filename of the tarball.
+function get_and_install()
+{
+  if [ $# -ne 1 ] || [ -z "$1" ]
+  then
+    echo "get_and_install requires a tarball argument"
+    return 1
+  fi
+  local filepath=$1
+  local url=${UPS_REPOSITORY_URL_BASE}/packages/${filepath}
+  local tarfile=$(basename $filepath)
+  echo Downloading $tarfile
+  $CURL $url || { echo Sorry - I could not download $url  If problem persists please contact us; return 1; }
+  echo Unpacking $tarfile
+  tar xf $tarfile || { echo Sorry - I was unable to untar $tarfile ; return 2; }
+  echo Removing $tarfile
+  rm $tarfile
+}
+
+# Clone the specified repository (argument 1) into the specified
+# directory (argument 2).
+function git_install()
+{
+  if [ $# -ne 2 ] || [ -z "$1" ] || [ -z "$2" ]
+  then
+    echo "git_install requires a repository url and local directory as arguments"
+    return 1
+  fi
+  local repo=$1
+  local target=$2
+  git clone "$QUIET_FLAG" "$repo" "$target" || { echo "Unable to use git to clone repository $repo"; return 1; }
+}
+
+# Use pip to install the given package (argument 1).
+function pip_install()
+{
+  if [ $# -lt 1 ] || [ -z "$1" ]
+  then
+    echo "pip_install requires the name of a package to install"
+    return 1
+  fi
+
+  local package=$1
+  local VERSION=""
+
+  if [ $# -ge 2 ]
+  then
+	VERSION="==$2"
+  fi
+
+  echo "installing $package..."
+  set -x
+  pip -q install --log ${package}.log --user "${package}${VERSION}" \
+      || \
+  {
+      echo "Unable to install $package, " \
+                          "check ${PWD}/${package}.log for more detail"
+      set +x
+      return 1
+  }
+  set +x
+  echo "done installing $package"
+}
+
+# Install Miniconda.
+function install_conda()
+{
+  if [ $# -ne 1 ] || [ -z "$1" ]
+  then
+    echo "install_conda requires the path into which Python will be installed"
+    return 1
+  fi
+    
+  local conda_dir="$1"
+  echo "Installing conda to " $conda_dir
+  ${CURL} http://repo.continuum.io/miniconda/Miniconda-$MINICONDA_VERSION-MacOSX-x86_64.sh
+  chmod +x Miniconda-$MINICONDA_VERSION-MacOSX-x86_64.sh
+  ./Miniconda-$MINICONDA_VERSION-MacOSX-x86_64.sh -b -p "$conda_dir"
+  rm -f Miniconda-$MINICONDA_VERSION-MacOSX-x86_64.sh
+  "$conda_dir/bin/conda" install --yes pip numpy matplotlib scipy astropy pyyaml ipython
+}
+
+function mkproddb()
+{
+    if [ $# -ne 1 ]; then
+      echo "mkproddb requires 1 argument";
+      return 1;
+    fi;
+    dname="$1";
+    if [ -e "${dname}/.upsfiles/dbconfig" ]; then
+      return 0;
+    fi;
+    mkdir -p "${dname}/.upsfiles";
+    cat > "${dname}/.upsfiles/dbconfig"  <<EOF
+FILE = DBCONFIG
+AUTHORIZED_NODES = *
+VERSION_SUBDIR = 1
+PROD_DIR_PREFIX = \${UPS_THIS_DB}
+UPD_USERCODE_DIR = \${UPS_THIS_DB}/.updfiles
+EOF
+}
+
+#-----------------------------------------------------------------------
+# Main body of the script begins here.
+#-----------------------------------------------------------------------
+
+# Handle option processing; establish default value for control variables.
+datainstall=0
+pythonpackages=1
+upsdir=""
+bleeding_edge=0
+insecure=0
+removetarballs=0
+while getopts ":pxkdru:e:t:" opt; do
+  case $opt in
+    d  ) datainstall=1 ;;
+    e  ) extrepos=(${OPTARG//,/ }) ;;
+    k  ) insecure=1 ;;
+    p  ) pythonpackages=0 ;;
+    r  ) removetarballs=1 ;;
+    t  ) tagname=$OPTARG ;;
+    u  ) upsdir=$OPTARG ;;
+    x  ) bleeding_edge=1 ;;
+    :  ) echo "Option -$OPTARG requires an argument." >& 2; usage; exit ;;
+    h  ) usage; exit ;;
+    \? ) usage; exit ;;
+  esac
+done
+
+shift $((OPTIND - 1))
+
+# Make sure we have the right number of arguments.
+if [ $# -ne 1 ]
+then
+  usage
+  exit 1
+fi
+
+#Enable insecure mode
+if [ 1 -eq ${insecure}  ]
+  then
+  CURL="${CURL} -k "
+  echo "Warning: insecure download mode; certificates will not be checked."
+fi
+
+# Check arguments.
+target="$1"
+
+# If the target directory exists, and is non-empty, quit.
+if [ -d "$target" ] && (( $(ls -A "$target" | wc -l) )) 
+then
+  die "The target directory '$target' already exists and is not empty"
+fi
+
+if [ ! -d "$target" ]
+then
+    mkdir -p "$target" || die "Failed to create target directory: '$target'"
+fi
+
+if [ 1 -eq "${datainstall}" ]
+then
+    echo Will install data products
+fi
+
+if [ -n "$upsdir" ]
+then
+  if [[ ! -d "$upsdir" || ! -e "$upsdir/setup" ]]
+  then
+    die "$upsdir does not appear to be a valid CosmoSIS UPS installation."
+  fi
+  upsdir_fully_qualified=$( (cd "$upsdir"; pwd -P) )
+fi
+
+# Process any list of repositories specified. Any unknown repository
+# causes an immediate failure.
+for repo in "${extrepos[@]}"
+do
+  case "$repo" in
+    des)
+        ;;
+    *)
+        die "External repository name \"$repo\" not recognized" ;;
+  esac
+done
+
+# Do platform detection. An unknown platform causes immediate failure.
+platform="unknown"
+macos="no"
+case $(uname -s) in
+  Darwin) 
+    darwin_version=$(sw_vers -productVersion)
+    if [[ "$darwin_version" =~ ^10.9.* ]]
+    then
+      platform="d13"
+      macos="yes"
+    elif [[ "$darwin_version" =~ ^10.10.* ]]
+    then
+      platform="d14"
+      macos="yes"
+    elif [[ "$darwin_version" =~ ^10.11.* ]]
+    then
+      platform="d15"
+      macos="yes"
+    elif [[ "$darwin_version" =~ ^10.12.* ]]
+    then
+      platform="d16"
+      macos="yes"
+    else
+        die "Sorry - cosmosis-bootstrap can not recognize your Darwin version. See the cosmosis wiki for supported systems."
+    fi
+    ;;
+  Linux)
+      plat_id=$(lsb_release -si)
+      plat_release=$(lsb_release -sr)
+      if grep -sqi "release 6" /etc/redhat-release
+      then
+        platform="slf6"
+      elif grep -sqi "release 7" /etc/redhat-release
+      then
+        platform="slf7"
+      elif [ "${plat_id}" == "Ubuntu" ] && [ "${plat_release}" == "14.04" ]
+      then
+        platform="u14"
+      elif [ "${plat_id}" == "Ubuntu" ] && [ "${plat_release}" == "16.04" ]
+      then
+        platform="u16"
+      fi
+      ;;
+esac
+
+if [ "unknown" == "$platform" ]
+then
+  die "Sorry - cosmosis-bootstrap does not support your OS [$platform].  See the cosmosis wiki for supported systems"
+fi
+
+# check for proper installation of dependencies
+if [ "$macos" == "yes" ]
+then
+  check_xcode_tools
+fi
+
+if [ "$platform" == "slf6" ]
+then
+    a=""
+
+    pkg-config --exists libpng      ||    a+=" libpng-devel"
+    pkg-config --exists freetype2   ||    a+=" freetype-devel"
+    [ -x /usr/lib64/liblapack.so ]  ||    a+=" lapack-devel"
+    hash git 2>/dev/null            ||    a+=" git"
+
+    [ "x"  ==  "x$a" ]  || \
+        die "Please install the following packages into your system: $a."
+
+    unset a
+fi
+
+
+# git clone cosmosis
+echo "Downloading CosmoSIS..."
+git_install "${COSMOSIS_REPOSITORY_URL_BASE}/cosmosis-clone" "$target" || die "Failed to install CosmoSIS"
+
+# Go to the target directory to do the remaining downloading and unwinding.
+pushd "$target" > /dev/null || die "Failed to change directory to ${target}"
+
+  #Check out the latest version tag, unless in bleeding edge mode
+if [ 0 -eq "${bleeding_edge}" ]
+  then
+  git checkout "$QUIET_FLAG" "${tagname:-$COSMOSIS_VERSION}" > /dev/null || die "Failed to checkout ${tagname:-$COSMOSIS_VERSION}"
+else
+ echo "Getting bleeding edge development version of cosmosis"
+ git checkout develop > /dev/null || die "Failed to checkout development version"
+fi
+
+# git clone cosmosis-standard-library
+echo "Downloading CosmoSIS Standard Library..."
+git_install https://bitbucket.org/joezuntz/cosmosis-standard-library cosmosis-standard-library || die "Failed to install CosmoSIS standard library"
+
+#Check out the latest version tag, unless in bleeding edge mode
+if [ 0 -eq "${bleeding_edge}" ]
+  then
+  pushd cosmosis-standard-library > /dev/null || die "Failed to change directory to cosmosis-standard-library"
+  git checkout develop > /dev/null || die "Failed to checkout latest CSL version ${COSMOSIS_VERSION}"
+  popd > /dev/null
+else
+  echo "Getting bleeding edge development version of CSL"
+  pushd cosmosis-standard-library > /dev/null || die "Failed to change directory to cosmosis-standard-library"
+  git checkout develop > /dev/null || die "Failed to checkout development version"
+  popd > /dev/null
+fi
+
+# Walk through the list of extra repositories, and clone each of them.
+for repo in "${extrepos[@]}"
+do
+  case "$repo" in
+    des)
+      echo "Downloading CosmoSIS DES Library..."
+      echo "This repository is limited to current DES collaboration members.  Enter the standard collaboration password at the prompt."
+      git_install https://darkenergysurvey@bitbucket.org/joezuntz/cosmosis-des-library cosmosis-des-library
+      if [ ! -e cosmosis-des-library ]
+      then
+        die "Error installing CosmoSIS DES Library!"
+      fi
+      ;;
+    *)
+      die "External repository name \"$repo\" not recognized" ;;
+  esac
+done
+
+
+# If $upsdir is not defined, we create a UPS directory an install things
+# in it.
+if [ -z "$upsdir" ]
+then
+  upsdir="ups"
+
+  if [ ! -d "$upsdir" ]
+  then
+    mkdir -p "$upsdir" || die "Failed to create ups target directory: $upsdir"
+  fi
+
+  pushd "$upsdir" > /dev/null || die "Failed to change directory to ${upsdir}"
+  upsdir_fully_qualified=$( pwd -P )
+ 
+  echo "Install CosmoSIS dependencies (UPS packages)..."
+
+  if [ ! -z "$PRODUCTS" ]
+  then
+    echo "You have the environment variable PRODUCTS set to $PRODUCTS."
+    echo "We will assume this points to an existing UPS product database."
+    echo "We will install only those products not already found in $PRODUCTS"
+  fi
+  
+  ${CURL} ${UPS_REPOSITORY_URL_BASE}/bundles/tools/pullProducts || die "Failed to download pullProducts script"
+  if [ ! -f "../config/cosmosis_ups_vers" ]
+  then
+    echo "The version file is missing from the CosmoSIS's config directory"
+    echo "Please report this error to the CosmoSIS developers"
+    exit 1
+  fi
+
+  # Determine the version and qualifiers for the cosmosis_ups used by
+  # the version of CosmosSIS checked out in the git repository.
+  # The 'sed' commands removes the -q (and a leading space),
+  # and replaces each colon with a space
+  arg_values=($(sed -e 's/ -q/ /g' -e 's/:/ /g' ../config/cosmosis_ups_vers))
+  if ! (( ${#arg_values[@]} ))
+  then
+    echo
+    "Failed to obtain cosmosis_ups version from CosmoSIS git repository: please report this as a bug"
+    exit 1
+  fi
+
+  chmod u+x pullProducts || die "Failed to make pullProducts script executable"
+  ./pullProducts "$PWD" "$platform" cosmosis_ups-"${arg_values[0]}" \
+                 "${arg_values[@]:1}" || die "Failed to install dependencies"
+  mkproddb "$PWD" || die "Failed to create UPS product database in $PWD"
+
+  # Handle data files, if requested.
+  if [ 1 -eq "${datainstall}" ]
+  then
+      get_and_install "planckdata/v1_1/planckdata-1.1.tar.bz2"
+      get_and_install "wmapdata/v5_00/wmapdata-5.00.tar.bz2"
+  fi
+
+  popd > /dev/null
+else
+  # add symlink to $upsdir_fully_qualified for data products
+  ln -s "$upsdir_fully_qualified" ups
+fi
+
+# write UPS dir to "configuration file"
+echo "$upsdir_fully_qualified" > config/ups || die "Unable to write to configuration directory"
+
+# do python installs (manually for now)
+if [ 1 -eq "${pythonpackages}" ]
+then
+
+  # set up CosmoSIS environment
+  echo "Setting up CosmoSIS environment..."
+  COSMOSIS_SRC_DIR="$( pwd -P )"
+  export COSMOSIS_SRC_DIR
+
+  source config/setup-cosmosis || die "Error setting up environment."
+
+  # On OS X, we install Anaconda python. We do this after setting up
+  # environment using UPS, so that we have an MPI implementation
+  # available.
+  if [ "yes" == "$macos" ]
+  then
+    conda_dir="$COSMOSIS_SRC_DIR"/conda
+    install_conda "$conda_dir"
+    PATH="$conda_dir"/bin:$PATH
+  fi
+
+  #--------------------------------------------------------------------
+
+  # Now we rely on the python on our PATH being the one we want to use.
+  PATH=$COSMOSIS_SRC_DIR/bin:$PATH
+
+  if [ "yes" != "$macos" ]
+  then
+    echo "Building python packages..."
+
+    pip_install ipython || die "Unable to pip-install ipython"
+    # install matplotlib and dependencies that are not already in our UPS python
+    pip_install python-dateutil || die "Unable to install python-dateutil (needed for matplotlib)"
+    pip_install tornado   || die "Unable to install tornado (needed for matplotlib)"
+
+    #
+    $CURL_ https://github.com/matplotlib/matplotlib/archive/v2.0.0.tar.gz \
+           --output matplotlib-2.0.0.tar.gz   \
+                      || \
+          die "Unable to obtain matplotlib installation file"
+
+    pip_install matplotlib-2.0.0.tar.gz || \
+      die "Unable to install matplotlib from downloaded installation file"
+
+    rm matplotlib-2.0.0.tar.gz
+    pip_install astropy || die "Unable to install astropy"
+  fi # if [ "yes" != "$macos" ]
+  #--------------------------------------------------------------------
+
+  # On all platforms, we expect to have pip available.
+  # Check to see if we already have pip installed
+  echo "Testing for pip"
+  type -p pip > /dev/null 2>&1 || die "Python package manager (pip) is not available on PATH"
+
+  # We will install mpi4py only if we have mpicc available.
+  echo "Testing for mpicc"
+  type -p mpicc > /dev/null 2>&1 ||  die "Unable to install mpi4py: missing mpicc"
+  pip_install mpi4py || die "Unable to install mpi4py"
+
+  # We pip-install our samplers on all platforms.
+  pip_install emcee || die "Unable to pip-install emcee"
+fi # if [ 1 -eq "${pythonpackages}" ]
+
+if [ 1 -eq "${removetarballs}" ]
+then
+  echo "Removing UPS installation tarballs"
+  rm -vf ups/*.tar.bz2
+fi
+
+echo "Thanks for installing CosmoSIS."
+echo
+echo "To complete installation, please do this:"
+echo
+echo "source $target/config/setup-cosmosis"
+echo "cd $COSMOSIS_SRC_DIR"
+echo "make"
